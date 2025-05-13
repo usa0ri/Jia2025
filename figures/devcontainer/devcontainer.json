@@ -1,0 +1,14 @@
+{
+    "name": "myPython",
+    "dockerFile": "Dockerfile",
+    "extensions": [
+        "ms-python.python"
+    ],
+    "mounts":[
+        "source=${localEnv:HOME}/Git/myRiboSeq_res/data,target=/home/data,type=bind,consistency=cached",
+        "source=${localEnv:HOME}/Git/myRiboSeq_res/result,target=/home/result,type=bind,consistency=cached",
+        "source=${localEnv:HOME}/Git/myRiboSeq_res/ref,target=/home/ref,type=bind,consistency=cached"
+    ],
+    "workspaceMount": "source=${localEnv:HOME}/Git/myRiboSeq/python,target=/home,type=bind,consistency=cached",
+    "workspaceFolder": "/home"
+}
