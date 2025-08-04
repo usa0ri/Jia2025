@@ -1,5 +1,5 @@
 
-from pathlib import Path
+from pathlib import Path, PosixPath
 import joblib
 import pickle
 import pandas as pd
@@ -9,6 +9,15 @@ import matplotlib.pyplot as plt
 from matplotlib.font_manager import FontProperties
 from scipy.sparse import coo_matrix
 from scipy.stats import gaussian_kde, pearsonr
+import re
+import gzip
+import itertools
+import pysam
+from tqdm import tqdm
+# import venn
+
+from myRiboSeq import myRef as myref
+from myRiboSeq import myUtil as my
 
 color_region = {
     '5UTR':"#9FE2BF",
@@ -546,4 +555,411 @@ def ratio_5utr_cds(
     fig.tight_layout()
     plt.show()
     fig.savefig(pdf, format='pdf')
+    pdf.close()
+
+
+
+def get_price_results_(
+    save_dir:PosixPath,
+    price_suffix_list:list
+):
+    save_dir = save_dir / 'PRICE_res'
+    if not save_dir.exists():
+        save_dir.mkdir()
+    
+    for output in save_dir.glob('**/*.gz'):
+        output.unlink(missing_ok=True)
+    
+    smpls = [re.findall(r'^price_(.*)',price_suffix.stem)[0] for price_suffix in price_suffix_list]
+    
+    df_orf_merge = pd.DataFrame()
+    for i,price_suffix in enumerate(price_suffix_list):
+        path_orfs = price_suffix.parent / (price_suffix.stem + '.orfs.tsv.gz')
+        df_orf = pd.read_csv(path_orfs,sep='\t',index_col=1,header=0)
+        df_orf = df_orf.set_axis([f'{c}_{smpls[i]}' for c in df_orf.columns], axis='columns', copy=False)
+        df_orf_merge = pd.merge(
+            df_orf_merge, df_orf, how='outer', left_index=True, right_index=True
+        )
+    
+    columns_remove = [f'Gene_{s}' for s in smpls] +\
+        [f'Codon_{s}' for s in smpls] +\
+        [f'Candidate Location_{s}' for s in smpls] +\
+        [c for c in df_orf_merge.columns if 'STAR_' in c]
+    df_orf_merge.drop(columns=columns_remove, inplace=True)
+    df_orf_merge.to_csv( save_dir / 'df_orf_merge.csv.gz', sep=',' )
+
+    print("hoge")
+    
+def reads_price_orfs(
+    save_dir:PosixPath,
+    load_price_path:PosixPath,
+    dict_bam:dict
+    ):
+
+    save_dir = save_dir / 'PRICE_res'
+    if not save_dir.exists():
+        save_dir.mkdir()
+    
+    df_orf_merge = pd.read_csv( load_price_path, sep=',', index_col=0, header=0 )
+    smpls = [c.split('Type_')[1] for c in df_orf_merge.columns if 'Type_' in c]
+    dict_orfs = {
+        i:list(set([
+            row[f'Location_{s}']
+            for s in smpls
+            if type(row[f'Location_{s}']) == str
+        ]))[0]
+        for i,row in df_orf_merge.iterrows()
+    }
+
+    df_counts = pd.DataFrame()
+    dict_orf_lengths = {}
+    for smpl, bam in dict_bam.items():
+
+        infile = pysam.AlignmentFile( bam, 'rb' )
+
+        dict_counts_smpl = {}
+        for i, location in tqdm(dict_orfs.items(),desc=f'counting reads of {smpl}...'):
+            
+            chrom_strand = location.split(':')[0]
+            chrom = chrom_strand[:-1]
+            strand = chrom_strand[-1]
+            starts = [int(x.split('-')[0]) for x in location.split(':')[1].split('|')]
+            ends = [int(x.split('-')[1]) for x in location.split(':')[1].split('|')]
+
+            cnts = 0;orf_len = 0
+            for start, end in zip(starts, ends):
+                # count reads in the specified region
+                cnts += infile.count(
+                    contig=chrom,
+                    start=start,
+                    end=end
+                )
+                orf_len += end - start
+            
+            dict_counts_smpl[i] = cnts
+            dict_orf_lengths[i] = orf_len
+
+        infile.close()
+
+        df_counts = pd.merge(
+            df_counts,
+            pd.DataFrame().from_dict(dict_counts_smpl,orient='index',columns=[smpl]),
+            how='outer',
+            left_index=True,
+            right_index=True
+        )  
+    df_counts['length'] = [
+        dict_orf_lengths[i]
+        for i in df_counts.index
+    ]  
+    df_counts.to_csv( save_dir / 'df_counts.csv.gz', sep=',' )
+
+def scatter_price_orfs(
+    save_dir:PosixPath,
+    load_price_count_path:PosixPath,
+    load_price_orf_path:PosixPath
+):
+    df_counts = pd.read_csv( load_price_count_path, sep=',', index_col=0, header=0 )
+    df_orf = pd.read_csv( load_price_orf_path, sep=',', index_col=0, header=0 )
+
+    # plot all the ATF4 ORFs
+    idx_atf4 = [i for i,idx in enumerate(df_orf.index) if 'ENST00000337304' in idx]
+    start_stop = [
+        [
+            df_orf.iloc[idx,:][c] for c in df_orf.iloc[idx,:].index 
+            if (type(df_orf.iloc[idx,:][c]) is str) and ('Location' in c) ][0]
+        for idx in idx_atf4
+    ]
+    start_stop = [[int(x_) for x_ in x.split(':')[1].split('-')] for x in start_stop]
+
+    # plot
+    # fig,ax = plt.subplots(1,1,figsize=(4,2))
+    # ids = []
+    # for i,idx in enumerate(idx_atf4):
+    #     ax.plot(
+    #         [start_stop[i][0],start_stop[i][1]],[i,i],
+    #         color='k'
+    #     )
+    #     ids.append(df_orf.index[idx])
+
+    # # start codon
+    # ax.axvline(
+    #     39521446
+    # )
+    # # stop codon
+    # ax.axvline(
+    #     39522600
+    # )
+    # # exon
+    # ax.axvspan(
+    #     39520564,39521671,
+    #     alpha=.2
+    # )
+    # ax.axvspan(
+    #     39521773,39522683,
+    #     alpha=.2
+    # )
+    # plt.close('all')
+
+    # multiple overlapped ORFs for ATF4
+    df_orf.drop(index=[
+        'ENST00000337304_dORF_9',
+        'ENST00000337304_dORF_10',
+        'ENST00000337304_dORF_11',
+        'ENST00000337304_uORF_10',
+        'ENST00000337304_uORF_3',
+        'ENST00000337304_uORF_5',
+        'ENST00000337304_uORF_6',
+        'ENST00000337304_iORF_9',
+        'ENST00000337304_iORF_11'
+
+    ],inplace=True)
+    df_counts.drop(index=[
+        'ENST00000337304_dORF_9',
+        'ENST00000337304_dORF_10',
+        'ENST00000337304_dORF_11',
+        'ENST00000337304_uORF_10',
+        'ENST00000337304_uORF_3',
+        'ENST00000337304_uORF_5',
+        'ENST00000337304_uORF_6',
+        'ENST00000337304_iORF_9',
+        'ENST00000337304_iORF_11'
+    ],inplace=True)
+
+    idx_atf4_uorf2 = [i for i,idx in enumerate(df_orf.index) if idx == 'ENST00000337304_iORF_8'][0]
+    idx_atf4_morf = [i for i,idx in enumerate(df_orf.index) if idx == 'ENST00000337304_Trunc_2'][0]
+    idx_atf4 = [idx_atf4_uorf2,idx_atf4_morf]
+
+    ## plot
+    pairs = [
+        ['Control_Ribo','Starvation_Ribo'],
+        ['Starvation_Ribo','Starvation_transATF4_Ribo1'],
+        ['Starvation_Ribo','Starvation_transATF4_Ribo2'],
+        ['Starvation_transATF4_Ribo1','Starvation_transATF4_Ribo2'],
+    ]
+    labels = [
+        ['Control','Starvation'],
+        ['Starvation','Starvation+transATF4_1'],
+        ['Starvation','Starvation+transATF4_2'],
+        ['Starvation+transATF4_1','Starvation+transATF4_2'],
+    ]
+    pdf = PdfPages(save_dir / 'scatter_price_orfs_Ribo.pdf')
+    ticks_now = [0,5,10,15]
+    for pair,label in zip(pairs,labels):
+        fig,ax = plt.subplots(1,1,figsize=(3,3))
+
+        # fold change
+        fc = np.log2(1+df_counts[pair[1]] /  df_counts['length']) - np.log2(1+df_counts[pair[0]] / df_counts['length'])
+        pd.DataFrame(fc,index=df_counts.index,columns=['log2 fold change'])\
+            .sort_values(by='log2 fold change',ascending=False)\
+            .to_csv(save_dir / f'fc_{pair[0]}_{pair[1]}.csv.gz',sep=',')
+        
+        ax.scatter(
+            np.log2(1+df_counts[pair[0]] /  df_counts['length']),
+            np.log2(1+df_counts[pair[1]] / df_counts['length']),
+            s=1,
+            facecolors='black',
+            edgecolors='black'
+        )
+        ax.plot(
+            [ax.get_xlim()[0],ax.get_xlim()[1]],
+            [ax.get_ylim()[0],ax.get_ylim()[1]],
+            linestyle='--',
+            color='#808080'
+        )
+        ax.scatter(
+            np.log2(1+df_counts[pair[0]].iloc[idx_atf4] /  df_counts['length'].iloc[idx_atf4]),
+            np.log2(1+df_counts[pair[1]].iloc[idx_atf4] /  df_counts['length'].iloc[idx_atf4]),
+            s=5,
+            facecolors='red',
+            edgecolors='red',
+        )
+        # annotation
+        idx = idx_atf4_uorf2
+        ax.text(
+            x=np.log2(1+df_counts[pair[0]].iloc[idx] /  df_counts['length'].iloc[idx]),
+            y=np.log2(1+df_counts[pair[1]].iloc[idx] /  df_counts['length'].iloc[idx]),
+            s='ATF4 uORF2',
+            fontsize=8,
+            color='red'
+        )
+        
+        idx = idx_atf4_morf
+        ax.text(
+            x=np.log2(1+df_counts[pair[0]].iloc[idx] /  df_counts['length'].iloc[idx]),
+            y=np.log2(1+df_counts[pair[1]].iloc[idx] /  df_counts['length'].iloc[idx]),
+            s='ATF4 mORF',
+            fontsize=8,
+            color='red'
+        )
+        ax.set_xlabel(f'log2 (mean reads), {label[0]}')
+        ax.set_ylabel(f'log2 (mean reads), {label[1]}')
+        ax.spines['right'].set_visible(False)
+        ax.spines['top'].set_visible(False)
+
+        # same ticklabels between x and y
+        ax.set_xticks(ticks_now)
+        ax.set_xticklabels(labels=ticks_now,fontsize=10)
+        ax.set_yticks(ticks_now)
+        ax.set_yticklabels(labels=ticks_now,fontsize=10)
+
+        fig.tight_layout()
+        fig.savefig(pdf,format='pdf')
+        plt.close()
+    pdf.close()
+
+
+
+def scatter_price_orfs_TE(
+    save_dir:PosixPath,
+    load_price_count_path:PosixPath,
+    load_price_orf_path:PosixPath
+):
+    df_counts = pd.read_csv( load_price_count_path, sep=',', index_col=0, header=0 )
+    df_orf = pd.read_csv( load_price_orf_path, sep=',', index_col=0, header=0 )
+
+    # plot all the ATF4 ORFs
+    idx_atf4 = [i for i,idx in enumerate(df_orf.index) if 'ENST00000337304' in idx]
+    start_stop = [
+        [
+            df_orf.iloc[idx,:][c] for c in df_orf.iloc[idx,:].index 
+            if (type(df_orf.iloc[idx,:][c]) is str) and ('Location' in c) ][0]
+        for idx in idx_atf4
+    ]
+    start_stop = [[int(x_) for x_ in x.split(':')[1].split('-')] for x in start_stop]
+
+    # plot
+    # fig,ax = plt.subplots(1,1,figsize=(4,2))
+    # ids = []
+    # for i,idx in enumerate(idx_atf4):
+    #     ax.plot(
+    #         [start_stop[i][0],start_stop[i][1]],[i,i],
+    #         color='k'
+    #     )
+    #     ids.append(df_orf.index[idx])
+
+    # # start codon
+    # ax.axvline(
+    #     39521446
+    # )
+    # # stop codon
+    # ax.axvline(
+    #     39522600
+    # )
+    # # exon
+    # ax.axvspan(
+    #     39520564,39521671,
+    #     alpha=.2
+    # )
+    # ax.axvspan(
+    #     39521773,39522683,
+    #     alpha=.2
+    # )
+    # plt.close('all')
+
+    # multiple overlapped ORFs for ATF4
+    df_orf.drop(index=[
+        'ENST00000337304_dORF_9',
+        'ENST00000337304_dORF_10',
+        'ENST00000337304_dORF_11',
+        'ENST00000337304_uORF_10',
+        'ENST00000337304_uORF_3',
+        'ENST00000337304_uORF_5',
+        'ENST00000337304_uORF_6',
+        'ENST00000337304_iORF_9',
+        'ENST00000337304_iORF_11'
+
+    ],inplace=True)
+    df_counts.drop(index=[
+        'ENST00000337304_dORF_9',
+        'ENST00000337304_dORF_10',
+        'ENST00000337304_dORF_11',
+        'ENST00000337304_uORF_10',
+        'ENST00000337304_uORF_3',
+        'ENST00000337304_uORF_5',
+        'ENST00000337304_uORF_6',
+        'ENST00000337304_iORF_9',
+        'ENST00000337304_iORF_11'
+    ],inplace=True)
+
+    idx_atf4_uorf2 = [i for i,idx in enumerate(df_orf.index) if idx == 'ENST00000337304_iORF_8'][0]
+    idx_atf4_morf = [i for i,idx in enumerate(df_orf.index) if idx == 'ENST00000337304_Trunc_2'][0]
+    idx_atf4 = [idx_atf4_uorf2,idx_atf4_morf]
+
+    ## plot
+    pairs = [
+        ['Control_Ribo','Starvation_Ribo'],
+        ['Starvation_Ribo','Starvation_transATF4_Ribo1'],
+        ['Starvation_Ribo','Starvation_transATF4_Ribo2'],
+        ['Starvation_transATF4_Ribo1','Starvation_transATF4_Ribo2'],
+    ]
+    labels = [
+        ['Control','Starvation'],
+        ['Starvation','Starvation+transATF4_1'],
+        ['Starvation','Starvation+transATF4_2'],
+        ['Starvation+transATF4_1','Starvation+transATF4_2'],
+    ]
+    pdf = PdfPages(save_dir / 'scatter_price_orfs_Ribo.pdf')
+    ticks_now = [0,5,10,15]
+    for pair,label in zip(pairs,labels):
+        fig,ax = plt.subplots(1,1,figsize=(3,3))
+
+        # fold change
+        fc = np.log2(1+df_counts[pair[1]] /  df_counts['length']) - np.log2(1+df_counts[pair[0]] / df_counts['length'])
+        pd.DataFrame(fc,index=df_counts.index,columns=['log2 fold change'])\
+            .sort_values(by='log2 fold change',ascending=False)\
+            .to_csv(save_dir / f'fc_{pair[0]}_{pair[1]}.csv.gz',sep=',')
+        
+        ax.scatter(
+            np.log2(1+df_counts[pair[0]] /  df_counts['length']),
+            np.log2(1+df_counts[pair[1]] / df_counts['length']),
+            s=1,
+            facecolors='black',
+            edgecolors='black'
+        )
+        ax.plot(
+            [ax.get_xlim()[0],ax.get_xlim()[1]],
+            [ax.get_ylim()[0],ax.get_ylim()[1]],
+            linestyle='--',
+            color='#808080'
+        )
+        ax.scatter(
+            np.log2(1+df_counts[pair[0]].iloc[idx_atf4] /  df_counts['length'].iloc[idx_atf4]),
+            np.log2(1+df_counts[pair[1]].iloc[idx_atf4] /  df_counts['length'].iloc[idx_atf4]),
+            s=5,
+            facecolors='red',
+            edgecolors='red',
+        )
+        # annotation
+        idx = idx_atf4_uorf2
+        ax.text(
+            x=np.log2(1+df_counts[pair[0]].iloc[idx] /  df_counts['length'].iloc[idx]),
+            y=np.log2(1+df_counts[pair[1]].iloc[idx] /  df_counts['length'].iloc[idx]),
+            s='ATF4 uORF2',
+            fontsize=8,
+            color='red'
+        )
+        
+        idx = idx_atf4_morf
+        ax.text(
+            x=np.log2(1+df_counts[pair[0]].iloc[idx] /  df_counts['length'].iloc[idx]),
+            y=np.log2(1+df_counts[pair[1]].iloc[idx] /  df_counts['length'].iloc[idx]),
+            s='ATF4 mORF',
+            fontsize=8,
+            color='red'
+        )
+        ax.set_xlabel(f'log2 (mean reads), {label[0]}')
+        ax.set_ylabel(f'log2 (mean reads), {label[1]}')
+        ax.spines['right'].set_visible(False)
+        ax.spines['top'].set_visible(False)
+
+        # same ticklabels between x and y
+        ax.set_xticks(ticks_now)
+        ax.set_xticklabels(labels=ticks_now,fontsize=10)
+        ax.set_yticks(ticks_now)
+        ax.set_yticklabels(labels=ticks_now,fontsize=10)
+
+        fig.tight_layout()
+        fig.savefig(pdf,format='pdf')
+        plt.close()
     pdf.close()
